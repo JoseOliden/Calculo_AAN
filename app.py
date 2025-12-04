@@ -185,6 +185,251 @@ def find_line_with_target(content_text, target):
             return line.strip()
     return None
 
+# ---------- INTEGRAR ESTAS IMPORTS si no están en app.py ----------
+import numpy as np
+import sympy as sp
+from scipy.optimize import root
+# -----------------------------------------------------------------
+
+# ===========================
+# FUNCIONES AUXILIARES DE CÁLCULO
+# ===========================
+
+# --- Funciones elementales de Aesp / factores ---
+def cal_D(lam, td):
+    """D = exp(lam * td)"""
+    return np.exp(lam * td)
+
+def cal_C(lam, tr):
+    """C = lam / (1 - exp(-lam * tr))"""
+    # evitar división por cero para lam*tr muy pequeños
+    denom = 1.0 - np.exp(-lam * tr)
+    return lam / denom if denom != 0 else np.nan
+
+def cal_H(tr, tv):
+    """H = tr / tv"""
+    return tr / tv if tv != 0 else np.nan
+
+def cal_S(lam, ti):
+    """S = 1 - exp(-lam * ti)"""
+    return 1.0 - np.exp(-lam * ti)
+
+def Aesp(Cn_i, w_i, lam, tr, td, ti, tv, e=None):
+    """
+    Calcula la actividad específica Aesp.
+    Observación: e está presente en la firma original pero no se usa en la fórmula.
+    """
+    C_i = cal_C(lam, tr)
+    D_i = cal_D(lam, td)
+    H_i = cal_H(tr, tv)
+    S_i = cal_S(lam, ti)
+    # Evitar division por cero
+    if S_i == 0 or w_i == 0 or tv == 0:
+        return np.nan
+    return Cn_i * D_i * C_i * H_i / (S_i * w_i)
+
+
+# --- Sistema para hallar alfa (si aún lo quieres usar) ---
+def equations_alfa(vars_arr, *par):
+    """
+    Ecuación para resolver alfa.
+    vars_arr: array-like con [alfa]
+    par: (Aesp1, k0_1, e1, Er1, Q0_1, Aesp2, k0_2, e2, Er2, Q0_2, Aesp3, k0_3, e3, Er3, Q0_3)
+    """
+    alfa = vars_arr[0]
+    (Aesp_1, k0_1, e_1, Er_1, Q0_1,
+     Aesp_2, k0_2, e_2, Er_2, Q0_2,
+     Aesp_3, k0_3, e_3, Er_3, Q0_3) = par
+
+    term12 = (1 - (Aesp_2 / Aesp_1) * (k0_1 / k0_2) * (e_1 / e_2))
+    term13 = (1 - (Aesp_3 / Aesp_1) * (k0_1 / k0_3) * (e_1 / e_3))
+
+    # Evitar potencias con negativos/ceros en denominadores
+    with np.errstate(all='ignore'):
+        eq1 = (term12 ** (-1) - term13 ** (-1)) * (Q0_1 - 0.429) / (Er_1 ** alfa) \
+              - (term12 ** (-1)) * (Q0_2 - 0.429) / (Er_2 ** alfa) \
+              + (term13 ** (-1)) * (Q0_3 - 0.429) / (Er_3 ** alfa)
+    return [eq1]
+
+
+def cal_Q0_alfa_i(Q0, Er, alfa):
+    """Calcula Q0_alfa para un elemento."""
+    # Fórmula tomada de tu código
+    return (Q0 - 0.429) / (Er ** alfa) + 0.429 / (2 * alfa + 0.55 ** alfa)
+
+
+def cal_f_alfa(Q0_alfa_c, Aesp_c, e_c, k0_c):
+    """
+    Calcula f a partir de arrays de comparadores (típicamente 2 o más valores).
+    Q0_alfa_c, Aesp_c, e_c, k0_c son arrays numpy o listas.
+    """
+    # Convertir a numpy para operaciones seguras
+    Q0_alfa_c = np.asarray(Q0_alfa_c)
+    Aesp_c = np.asarray(Aesp_c)
+    e_c = np.asarray(e_c)
+    k0_c = np.asarray(k0_c)
+
+    num = (k0_c[0] / k0_c[1]) * (e_c[0] / e_c[1]) * Q0_alfa_c[0] - (Aesp_c[0] / Aesp_c[1]) * Q0_alfa_c[1]
+    den = (Aesp_c[0] / Aesp_c[1]) - (k0_c[0] / k0_c[1]) * (e_c[0] / e_c[1])
+    return num / den if den != 0 else np.nan
+
+
+def cal_alfa(par_comp, equations_func=equations_alfa, guess=0.2):
+    """
+    Calcula alfa resolviendo el sistema con scipy.optimize.root.
+    par_comp: tu tuple (k0_c, e_c, Q0_c, Cn_c, w_c, lam_c, Er_c, td_c, tr_c, ti_c, tv_c)
+    Devuelve alfa (float) o np.nan si no converge.
+    """
+    k0_c, e_c, Q0_c, Cn_c, w_c, lam_c, Er_c, td_c, tr_c, ti_c, tv_c = par_comp
+    # Calcular Aesp de los comparadores
+    Aesp_c = np.zeros(len(k0_c))
+    for i in range(len(k0_c)):
+        Aesp_c[i] = Aesp(Cn_c[i], w_c[i], lam_c[i], tr_c[i], td_c[i], ti_c[i], tv_c[i], e_c[i])
+
+    # Preparar parámetros para la ecuación
+    par = (Aesp_c[0], k0_c[0], e_c[0], Er_c[0], Q0_c[0],
+           Aesp_c[1], k0_c[1], e_c[1], Er_c[1], Q0_c[1],
+           Aesp_c[2], k0_c[2], e_c[2], Er_c[2], Q0_c[2])
+
+    sol = root(equations_func, x0=[guess], args=par)
+    if sol.success:
+        return float(sol.x[0])
+    else:
+        # No convergió
+        return np.nan
+
+
+def conc(par_ele, par_comp, par_comp_Au, equations_func=equations_alfa, alfa_override=None, f_override=None):
+    """
+    Calcula la concentración C de un elemento.
+    par_ele: (k0_i, e_i, Q0_i, Cn_i, w_i, lamb_i, Er_i, td_i, tr_i, ti_i, tv_i)
+    par_comp: tuple de comparadores
+    par_comp_Au: tuple del comparador Au
+    alfa_override: si se pasa, usa ese alfa en lugar de solucionarlo
+    f_override: si se pasa, usa ese f en lugar de calcularlo
+    Retorna: (C, alfa, f, variables_2_U)
+    variables_2_U es una tupla con los valores que tu código esperaba para cálculo de incertidumbre.
+    """
+    k0_i, e_i, Q0_i, Cn_i, w_i, lamb_i, Er_i, td_i, tr_i, ti_i, tv_i = par_ele
+    k0_c, e_c, Q0_c, Cn_c, w_c, lam_c, Er_c, td_c, tr_c, ti_c, tv_c = par_comp
+    k0_c_Au, e_c_Au, Q0_c_Au, Cn_c_Au, w_c_Au, lam_c_Au, Er_c_Au, td_c_Au, tr_c_Au, ti_c_Au, tv_c_Au = par_comp_Au
+
+    # Actividades específicas
+    Aesp_i = Aesp(Cn_i, w_i, lamb_i, tr_i, td_i, ti_i, tv_i, e_i)
+    Aesp_c_Au = Aesp(Cn_c_Au, w_c_Au, lam_c_Au, tr_c_Au, td_c_Au, ti_c_Au, tv_c_Au, e_c_Au)
+
+    Aesp_c = np.zeros(len(k0_c))
+    for j in range(len(k0_c)):
+        Aesp_c[j] = Aesp(Cn_c[j], w_c[j], lam_c[j], tr_c[j], td_c[j], ti_c[j], tv_c[j], e_c[j])
+
+    # alfa
+    alfa = cal_alfa(par_comp, equations_func) if alfa_override is None else alfa_override
+    # Q0_alfa
+    Q0_alfa_i = cal_Q0_alfa_i(Q0_i, Er_i, alfa)
+    Q0_alfa_c_Au = cal_Q0_alfa_i(Q0_c_Au, Er_c_Au, alfa)
+    Q0_alfa_c = np.zeros(len(k0_c))
+    for j in range(len(k0_c)):
+        Q0_alfa_c[j] = cal_Q0_alfa_i(Q0_c[j], Er_c[j], alfa)
+
+    # f
+    f = cal_f_alfa(Q0_alfa_c, Aesp_c, e_c, k0_c) if f_override is None else f_override
+
+    # Concentración
+    with np.errstate(all='ignore'):
+        C = (Aesp_i / Aesp_c_Au) * (k0_c_Au / k0_i) * (e_c_Au / e_i) * ((f + Q0_alfa_c_Au) / (f + Q0_alfa_i))
+
+    # Construir variables_2_U exactamente como tu código original esperaba
+    variables_2_U = (Cn_i, Cn_c[0], Cn_c[1], Cn_c_Au,
+                     Er_i, Er_c[0], Er_c[1], Er_c_Au,
+                     Q0_i, Q0_c[0], Q0_c[1], Q0_c_Au,
+                     alfa, e_i, e_c[0], e_c[1], e_c_Au,
+                     k0_i, k0_c[0], k0_c[1], k0_c_Au,
+                     lamb_i, lam_c[0], lam_c[1], lam_c_Au,
+                     td_i, td_c[0], td_c[1], td_c_Au,
+                     ti_i, ti_c[0], ti_c[1], ti_c_Au,
+                     tr_i, tr_c[0], tr_c[1], tr_c_Au,
+                     tv_i, tv_c[0], tv_c[1], tv_c_Au,
+                     w_i, w_c[0], w_c[1], w_c_Au)
+
+    return C, alfa, f, variables_2_U
+
+
+# --- Incertidumbre: cal_U y cal_U_Aesp usando sympy derivadas ---
+def cal_U_Aesp(Val_ini, u_v_ini):
+    """
+    Calcula incertidumbre para la expresión Aesp (fórmula interna).
+    Val_ini: (Cn, lamb, td, ti, tr, tv, w)
+    u_v_ini: mismas longitudes con incertidumbres absolutas
+    Retorna (u_y, y_val)
+    """
+    # fórmula dada en tu código
+    formula_str = "(Cn*exp(lamb*td)*lamb*tr)/((1-exp(-lamb*ti))*(1-exp(-lamb*tr))*w*tv)"
+    # convertir a sympy
+    try:
+        formula_sym = sp.sympify(formula_str)
+    except Exception as e:
+        raise RuntimeError(f"Error al interpretar fórmula simbólica en cal_U_Aesp: {e}")
+
+    # extraer variables en orden consistente
+    variables = sorted(list(formula_sym.free_symbols), key=lambda x: str(x))
+    # mapear valores e incertidumbres por nombre
+    valores = {str(v): Val_ini[i] for i, v in enumerate(variables)}
+    incertidumbres = {str(v): u_v_ini[i] for i, v in enumerate(variables)}
+
+    # evaluar valor central
+    y_val = float(formula_sym.evalf(subs=valores))
+
+    # calcular derivadas parciales y contribuciones
+    u_y_squared = 0.0
+    contribuciones = []
+    for v in variables:
+        derivada = float(sp.diff(formula_sym, v).evalf(subs=valores))
+        u_i = incertidumbres[str(v)]
+        contrib = (derivada * u_i) ** 2
+        contribuciones.append((str(v), derivada, u_i, contrib))
+        u_y_squared += contrib
+
+    u_y = float(np.sqrt(u_y_squared)) if u_y_squared >= 0 else np.nan
+    return u_y, y_val
+
+
+def cal_U(Val_ini, u_v_ini):
+    """
+    Calcula la incertidumbre combinada para la fórmula compleja (tu fórmula grande).
+    Val_ini: tu tupla larga de valores
+    u_v_ini: tu tupla larga de incertidumbres absolutas
+    Retorna (u_y, y_val)
+    """
+    # Montamos la misma fórmula simbólica que tenías en tu código (usada para evaluación y derivadas)
+    formula_str = "(Aesp/Aesp_c_Au)*(k0_c_Au/k0)*(e_c_Au/e)*(((k0_1/k0_2)*(e_1/e_2)*((Q0_1 -0.429)/((Er_1)**alfa)+0.429/((2*alfa-1)*0.55**alfa))-(Aesp_1/Aesp_2)*((Q0_2 -0.429)/((Er_2)**alfa)+0.429/((2*alfa-1)*0.55**alfa)))/((Aesp_1/Aesp_2)-(k0_1/k0_2)*(e_1/e_2))+((Q0_c_Au -0.429)/((Er_c_Au)**alfa)+0.429/((2*alfa-1)*0.55**alfa))) / (((k0_1/k0_2)*(e_1/e_2)*((Q0_1 -0.429)/((Er_1)**alfa)+0.429/((2*alfa-1)*0.55**alfa))-(Aesp_1/Aesp_2)*((Q0_2 -0.429)/((Er_2)**alfa)+0.429/((2*alfa-1)*0.55**alfa)))/((Aesp_1/Aesp_2)-(k0_1/k0_2)*(e_1/e_2))+((Q0 -0.429)/((Er)**alfa)+0.429/((2*alfa-1)*0.55**alfa)))"
+
+    try:
+        formula_sym = sp.sympify(formula_str)
+    except Exception as e:
+        raise RuntimeError(f"Error al interpretar fórmula simbólica en cal_U: {e}")
+
+    variables = sorted(list(formula_sym.free_symbols), key=lambda x: str(x))
+
+    # Mapear valores e incertidumbres a los símbolos en el mismo orden
+    valores = {str(v): Val_ini[i] for i, v in enumerate(variables)}
+    incertidumbres = {str(v): u_v_ini[i] for i, v in enumerate(variables)}
+
+    # Evaluar valor central
+    y_val = float(formula_sym.evalf(subs=valores))
+
+    # Calcular derivadas parciales y contribuciones
+    u_y_squared = 0.0
+    for v in variables:
+        derivada = float(sp.diff(formula_sym, v).evalf(subs=valores))
+        u_i = incertidumbres[str(v)]
+        contrib = (derivada * u_i) ** 2
+        u_y_squared += contrib
+
+    u_y = float(np.sqrt(u_y_squared)) if u_y_squared >= 0 else np.nan
+    return u_y, y_val
+
+
+
 # ----------------------------
 # INTERFAZ STREAMLIT
 # ----------------------------
